@@ -1,16 +1,11 @@
 use std::fs;
 
-use const_format::formatcp;
-
-use crate::HOME;
+use crate::{home, ssh};
 use crate::profile::profile::{Profile, profile_path};
-use crate::ssh;
 
 pub mod profile;
 pub mod cache;
 pub mod error;
-
-pub(crate) const PROFILES_DIR: &str = formatcp!("{HOME}/.config/g-profiles");
 
 type Result<T> = std::result::Result<T, error::Error>;
 
@@ -23,7 +18,7 @@ type Result<T> = std::result::Result<T, error::Error>;
 /// }
 /// ```
 pub fn list() -> Result<Vec<String>> {
-    let paths = fs::read_dir(PROFILES_DIR)?;
+    let paths = fs::read_dir(&profiles_dir())?;
     let names = paths
         .map(|dir_entry| dir_entry.unwrap().path())
         .filter(|path| path.is_file())
@@ -60,6 +55,9 @@ pub fn remove(name: &str) -> Result<()> {
 /// edit(profile, None, Some("new@email.com".to_string()))).expect(&format!("Can't edit {profile}"));
 /// ```
 pub fn edit(name: &str, username: Option<String>, email: Option<String>) -> Result<()> {
+    if username.is_none() && email.is_none() {
+        return Ok(());
+    }
     let mut profile = Profile::load(name)?;
     if let Some(usr_name) = username {
         profile.username = usr_name.to_string();
@@ -69,4 +67,8 @@ pub fn edit(name: &str, username: Option<String>, email: Option<String>) -> Resu
     };
 
     profile.save(true)
+}
+
+fn profiles_dir() -> String {
+    format!("{}/.config/g-profiles", home())
 }

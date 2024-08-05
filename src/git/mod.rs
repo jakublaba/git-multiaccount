@@ -1,10 +1,12 @@
-use std::env;
-use std::path::Path;
+use std::{env, io};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use git2::Config;
 
 use crate::git::error::Error;
-use crate::HOME;
+use crate::home;
 use crate::profile::profile::Profile;
 
 type Result<T> = std::result::Result<T, error::Error>;
@@ -62,17 +64,138 @@ fn is_inside_repo() -> bool {
     path.exists() && path.is_dir()
 }
 
+const TIMEOUT: Duration = Duration::from_millis(1);
 fn config(global: bool) -> Result<Config> {
-    let config = if global {
-        Config::open_default()?
+    let config_path = if global {
+        format!("{}/.gitconfig", home())
     } else {
-        let config_path = format!("{}/.git/config", env::current_dir()?.display());
-        Config::open(Path::new(&config_path))?
+        format!("{}/.git/config", env::current_dir()?.display())
     };
+    let lock_path = PathBuf::from(format!("{config_path}.lock"));
+    let start = Instant::now();
+    while lock_path.exists() {
+        if start.elapsed() >= TIMEOUT {
+            Err(io::Error::new(ErrorKind::TimedOut, &*format!("Timed out waiting for {}", lock_path.display())))?;
+        }
+    }
+    let config = Config::open(Path::new(&config_path))?;
 
     Ok(config)
 }
 
 fn ssh_command(profile_name: &str) -> String {
-    format!("ssh -i {HOME}/.ssh/id_{profile_name} -F /dev/null")
+    format!("ssh -i {}/.ssh/id_{profile_name} -F /dev/null", home())
+}
+
+#[cfg(test)]
+mod test {
+    use std::{env, fs};
+
+    use git2::{Config, Repository};
+    use rstest::{fixture, rstest};
+    use spectral::assert_that;
+    use spectral::prelude::ResultAssertions;
+    use tempfile::{tempdir, TempDir};
+
+    use super::*;
+
+    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    mod configure_user {
+        use std::sync::Mutex;
+
+        use lazy_static::lazy_static;
+
+        use super::*;
+
+        lazy_static! {
+            static ref ENV_LOCK: Mutex<()> = Mutex::new(());
+        }
+
+        #[fixture]
+        #[once]
+        fn profile() -> Profile {
+            Profile::new("test", "Test Profile", "em@i.l").unwrap()
+        }
+
+        #[fixture]
+        fn fake_home() -> TempDir {
+            let _lock = ENV_LOCK.lock();
+            let fake_home = tempdir().unwrap();
+            env::set_var("HOME", fake_home.path().to_string_lossy().to_string());
+            eprintln!("temporary $HOME override: {}", fake_home.path().display());
+
+            fake_home
+        }
+
+        #[fixture]
+        fn fake_repo() -> TempDir {
+            let fake_repo = tempdir().unwrap();
+            Repository::init(fake_repo.path()).unwrap();
+
+            fake_repo
+        }
+
+        #[rstest]
+        fn set_local_config_in_repo(profile: &Profile, fake_repo: TempDir) -> TestResult<()> {
+            let _lock = ENV_LOCK.lock()?;
+            env::set_current_dir(fake_repo.path())?;
+
+            let result = configure_user(profile, false);
+            let config = Config::open(&fake_repo.path().join(".git/config"))?.snapshot()?;
+
+            assert_that!(result).is_ok();
+            assert_that!(config.get_str("user.name")?)
+                .is_equal_to(&*profile.username);
+            assert_that!(config.get_str("user.email")?)
+                .is_equal_to(&*profile.email);
+            assert_that!(config.get_str("core.sshCommand")?)
+                .is_equal_to(&*ssh_command(&profile.name));
+
+            Ok(())
+        }
+
+        #[rstest]
+        fn set_global_config_in_repo(profile: &Profile, fake_repo: TempDir, fake_home: TempDir) -> TestResult<()> {
+            let _lock = ENV_LOCK.lock()?;
+            env::set_current_dir(fake_repo.path())?;
+
+            env::set_var("HOME", fake_home.path().to_string_lossy().to_string());
+            fs::write(fake_home.path().join(".gitconfig"), "")?;
+
+            let result = configure_user(profile, true);
+            let config = Config::open(&fake_home.path().join(".gitconfig"))?.snapshot()?;
+
+            assert_that!(result).is_ok();
+            assert_that!(config.get_str("user.name")?)
+                .is_equal_to(&*profile.username);
+            assert_that!(config.get_str("user.email")?)
+                .is_equal_to(&*profile.email);
+            assert_that!(config.get_str("core.sshCommand")?)
+                .is_equal_to(&*ssh_command(&profile.name));
+
+            Ok(())
+        }
+
+        #[rstest]
+        fn set_global_config_outside_repo(profile: &Profile, fake_repo: TempDir, fake_home: TempDir) -> TestResult<()> {
+            let _lock = ENV_LOCK.lock()?;
+            env::set_current_dir(fake_repo.path())?;
+
+            fs::write(fake_home.path().join(".gitconfig"), "")?;
+
+            let result = configure_user(profile, true);
+            let config = Config::open(&fake_home.path().join(".gitconfig"))?.snapshot()?;
+
+            assert_that!(result).is_ok();
+            assert_that!(config.get_str("user.name")?)
+                .is_equal_to(&*profile.username);
+            assert_that!(config.get_str("user.email")?)
+                .is_equal_to(&*profile.email);
+            assert_that!(config.get_str("core.sshCommand")?)
+                .is_equal_to(&*ssh_command(&profile.name));
+
+            Ok(())
+        }
+    }
 }
